@@ -38,7 +38,13 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
+          pushd plugin/hysteria2/src/main/go/hysteria2
+          git apply ../remove-gpl-deps.patch
+          popd
           ./run plugin hysteria2
+          pushd plugin/hysteria2/src/main/go/hysteria2
+          git apply -R ../remove-gpl-deps.patch
+          popd
       - name: Gradle cache
         uses: actions/cache@v4
         with:

@@ -7,7 +7,7 @@ A proxy client powered by a modified version of v2ray-core. It is a fork of Sage
   [<img src="images/get-it-on-github.png" alt="Get it on GitHub" height="80">](https://github.com/dyhkwong/Exclave/releases) [<img src="images/get-it-on-f-droid.png" alt="Get it on F-Droid" height="80">](https://f-droid.org/packages/com.github.dyhkwong.sagernet)
 
 - [NaïveProxy plugin](https://github.com/klzgrad/naiveproxy/releases) (use upstream releases directly)
-- [Hysteria 2 plugin](https://github.com/dyhkwong/Exclave/releases?q=hysteria-plugin-2)
+- [Hysteria 2 plugin](https://github.com/dyhkwong/Exclave/releases?q=hysteria-plugin-2) (with GPL dependencies removed)
 - [Mieru plugin](https://github.com/dyhkwong/Exclave/releases?q=mieru-plugin-3) or [use upstream releases directly](https://github.com/enfein/NekoBoxPlugins/releases)
 - [Juicity plugin](https://github.com/dyhkwong/Exclave/releases?q=juicity-plugin)
 - [TUIC v5 plugin](https://github.com/dyhkwong/Exclave/releases?q=tuic-plugin-1)

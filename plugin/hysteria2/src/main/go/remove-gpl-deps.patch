@@ -1,0 +1,846 @@
+diff --git a/app/cmd/client.go b/app/cmd/client.go
+index 05fec80..d458a45 100644
+--- a/app/cmd/client.go
++++ b/app/cmd/client.go
+@@ -5,13 +5,9 @@ import (
+ 	"crypto/x509"
+ 	"encoding/hex"
+ 	"errors"
+-	"fmt"
+ 	"net"
+-	"net/netip"
+ 	"os"
+ 	"os/signal"
+-	"runtime"
+-	"slices"
+ 	"strconv"
+ 	"strings"
+ 	"syscall"
+@@ -28,7 +24,6 @@ import (
+ 	"github.com/apernet/hysteria/app/v2/internal/sockopts"
+ 	"github.com/apernet/hysteria/app/v2/internal/socks5"
+ 	"github.com/apernet/hysteria/app/v2/internal/tproxy"
+-	"github.com/apernet/hysteria/app/v2/internal/tun"
+ 	"github.com/apernet/hysteria/app/v2/internal/url"
+ 	"github.com/apernet/hysteria/app/v2/internal/utils"
+ 	"github.com/apernet/hysteria/core/v2/client"
+@@ -74,7 +69,6 @@ type clientConfig struct {
+ 	TCPTProxy     *tcpTProxyConfig      `mapstructure:"tcpTProxy"`
+ 	UDPTProxy     *udpTProxyConfig      `mapstructure:"udpTProxy"`
+ 	TCPRedirect   *tcpRedirectConfig    `mapstructure:"tcpRedirect"`
+-	TUN           *tunConfig            `mapstructure:"tun"`
+ }
+ 
+ type clientConfigTransportUDP struct {
+@@ -162,23 +156,6 @@ type tcpRedirectConfig struct {
+ 	Listen string `mapstructure:"listen"`
+ }
+ 
+-type tunConfig struct {
+-	Name    string        `mapstructure:"name"`
+-	MTU     uint32        `mapstructure:"mtu"`
+-	Timeout time.Duration `mapstructure:"timeout"`
+-	Address struct {
+-		IPv4 string `mapstructure:"ipv4"`
+-		IPv6 string `mapstructure:"ipv6"`
+-	} `mapstructure:"address"`
+-	Route *struct {
+-		Strict      bool     `mapstructure:"strict"`
+-		IPv4        []string `mapstructure:"ipv4"`
+-		IPv6        []string `mapstructure:"ipv6"`
+-		IPv4Exclude []string `mapstructure:"ipv4Exclude"`
+-		IPv6Exclude []string `mapstructure:"ipv6Exclude"`
+-	} `mapstructure:"route"`
+-}
+-
+ func (c *clientConfig) fillServerAddr(hyConfig *client.Config) error {
+ 	if c.Server == "" {
+ 		return configError{Field: "server", Err: errors.New("server address is empty")}
+@@ -514,11 +491,6 @@ func runClient(cmd *cobra.Command, args []string) {
+ 			return clientTCPRedirect(*config.TCPRedirect, c)
+ 		})
+ 	}
+-	if config.TUN != nil {
+-		runner.Add("TUN", func() error {
+-			return clientTUN(*config.TUN, c)
+-		})
+-	}
+ 
+ 	signalChan := make(chan os.Signal, 1)
+ 	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+@@ -749,92 +721,6 @@ func clientTCPRedirect(config tcpRedirectConfig, c client.Client) error {
+ 	return p.ListenAndServe(laddr)
+ }
+ 
+-func clientTUN(config tunConfig, c client.Client) error {
+-	supportedPlatforms := []string{"linux", "darwin", "windows", "android"}
+-	if !slices.Contains(supportedPlatforms, runtime.GOOS) {
+-		logger.Error("TUN is not supported on this platform", zap.String("platform", runtime.GOOS))
+-	}
+-	if config.Name == "" {
+-		return configError{Field: "name", Err: errors.New("name is empty")}
+-	}
+-	if config.MTU == 0 {
+-		config.MTU = 1500
+-	}
+-	timeout := int64(config.Timeout.Seconds())
+-	if timeout == 0 {
+-		timeout = 300
+-	}
+-	if config.Address.IPv4 == "" {
+-		config.Address.IPv4 = "100.100.100.101/30"
+-	}
+-	prefix4, err := netip.ParsePrefix(config.Address.IPv4)
+-	if err != nil {
+-		return configError{Field: "address.ipv4", Err: err}
+-	}
+-	if config.Address.IPv6 == "" {
+-		config.Address.IPv6 = "2001::ffff:ffff:ffff:fff1/126"
+-	}
+-	prefix6, err := netip.ParsePrefix(config.Address.IPv6)
+-	if err != nil {
+-		return configError{Field: "address.ipv6", Err: err}
+-	}
+-	server := &tun.Server{
+-		HyClient:     c,
+-		EventLogger:  &tunLogger{},
+-		Logger:       logger,
+-		IfName:       config.Name,
+-		MTU:          config.MTU,
+-		Timeout:      timeout,
+-		Inet4Address: []netip.Prefix{prefix4},
+-		Inet6Address: []netip.Prefix{prefix6},
+-	}
+-	if config.Route != nil {
+-		server.AutoRoute = true
+-		server.StructRoute = config.Route.Strict
+-
+-		parsePrefixes := func(field string, ss []string) ([]netip.Prefix, error) {
+-			var prefixes []netip.Prefix
+-			for i, s := range ss {
+-				var p netip.Prefix
+-				if strings.Contains(s, "/") {
+-					var err error
+-					p, err = netip.ParsePrefix(s)
+-					if err != nil {
+-						return nil, configError{Field: fmt.Sprintf("%s[%d]", field, i), Err: err}
+-					}
+-				} else {
+-					pa, err := netip.ParseAddr(s)
+-					if err != nil {
+-						return nil, configError{Field: fmt.Sprintf("%s[%d]", field, i), Err: err}
+-					}
+-					p = netip.PrefixFrom(pa, pa.BitLen())
+-				}
+-				prefixes = append(prefixes, p)
+-			}
+-			return prefixes, nil
+-		}
+-
+-		server.Inet4RouteAddress, err = parsePrefixes("route.ipv4", config.Route.IPv4)
+-		if err != nil {
+-			return err
+-		}
+-		server.Inet6RouteAddress, err = parsePrefixes("route.ipv6", config.Route.IPv6)
+-		if err != nil {
+-			return err
+-		}
+-		server.Inet4RouteExcludeAddress, err = parsePrefixes("route.ipv4Exclude", config.Route.IPv4Exclude)
+-		if err != nil {
+-			return err
+-		}
+-		server.Inet6RouteExcludeAddress, err = parsePrefixes("route.ipv6Exclude", config.Route.IPv6Exclude)
+-		if err != nil {
+-			return err
+-		}
+-	}
+-	logger.Info("TUN listening", zap.String("interface", config.Name))
+-	return server.Serve()
+-}
+-
+ // parseServerAddrString parses server address string.
+ // Server address can be in either "host:port" or "host" format (in which case we assume port 443).
+ func parseServerAddrString(addrStr string) (host, port, hostPort string) {
+@@ -1005,29 +891,3 @@ func (l *tcpRedirectLogger) Error(addr, reqAddr net.Addr, err error) {
+ 		logger.Warn("TCP redirect error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+ 	}
+ }
+-
+-type tunLogger struct{}
+-
+-func (l *tunLogger) TCPRequest(addr, reqAddr string) {
+-	logger.Debug("TUN TCP request", zap.String("addr", addr), zap.String("reqAddr", reqAddr))
+-}
+-
+-func (l *tunLogger) TCPError(addr, reqAddr string, err error) {
+-	if err == nil {
+-		logger.Debug("TUN TCP closed", zap.String("addr", addr), zap.String("reqAddr", reqAddr))
+-	} else {
+-		logger.Warn("TUN TCP error", zap.String("addr", addr), zap.String("reqAddr", reqAddr), zap.Error(err))
+-	}
+-}
+-
+-func (l *tunLogger) UDPRequest(addr string) {
+-	logger.Debug("TUN UDP request", zap.String("addr", addr))
+-}
+-
+-func (l *tunLogger) UDPError(addr string, err error) {
+-	if err == nil {
+-		logger.Debug("TUN UDP closed", zap.String("addr", addr))
+-	} else {
+-		logger.Warn("TUN UDP error", zap.String("addr", addr), zap.Error(err))
+-	}
+-}
+diff --git a/app/cmd/server.go b/app/cmd/server.go
+index a2aa9a4..99bdf59 100644
+--- a/app/cmd/server.go
++++ b/app/cmd/server.go
+@@ -690,11 +690,6 @@ func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
+ 			return configError{Field: "resolver.tls.addr", Err: errors.New("empty resolver address")}
+ 		}
+ 		uOb = outbounds.NewStandardResolverTLS(c.Resolver.TLS.Addr, c.Resolver.TLS.Timeout, c.Resolver.TLS.SNI, c.Resolver.TLS.Insecure, uOb)
+-	case "https", "http":
+-		if c.Resolver.HTTPS.Addr == "" {
+-			return configError{Field: "resolver.https.addr", Err: errors.New("empty resolver address")}
+-		}
+-		uOb = outbounds.NewDoHResolver(c.Resolver.HTTPS.Addr, c.Resolver.HTTPS.Timeout, c.Resolver.HTTPS.SNI, c.Resolver.HTTPS.Insecure, uOb)
+ 	default:
+ 		return configError{Field: "resolver.type", Err: errors.New("unsupported resolver type")}
+ 	}
+diff --git a/app/go.mod b/app/go.mod
+index 25d1fd3..2b2d6c6 100644
+--- a/app/go.mod
++++ b/app/go.mod
+@@ -8,7 +8,6 @@ require (
+ 	github.com/apernet/go-tproxy v0.0.0-20230809025308-8f4723fd742f
+ 	github.com/apernet/hysteria/core/v2 v2.0.0-00010101000000-000000000000
+ 	github.com/apernet/hysteria/extras/v2 v2.0.0-00010101000000-000000000000
+-	github.com/apernet/sing-tun v0.2.6-0.20240323130332-b9f6511036ad
+ 	github.com/caddyserver/certmagic v0.17.2
+ 	github.com/libdns/cloudflare v0.1.1
+ 	github.com/libdns/duckdns v0.2.0
+@@ -18,7 +17,6 @@ require (
+ 	github.com/libdns/vultr v1.0.0
+ 	github.com/mdp/qrterminal/v3 v3.1.1
+ 	github.com/mholt/acmez v1.0.4
+-	github.com/sagernet/sing v0.3.2
+ 	github.com/spf13/cobra v1.7.0
+ 	github.com/spf13/viper v1.15.0
+ 	github.com/stretchr/testify v1.9.0
+@@ -31,13 +29,11 @@ require (
+ require (
+ 	github.com/andybalholm/brotli v1.1.0 // indirect
+ 	github.com/apernet/quic-go v0.52.1-0.20250607183305-9320c9d14431 // indirect
+-	github.com/babolivier/go-doh-client v0.0.0-20201028162107-a76cff4cb8b6 // indirect
+ 	github.com/cloudflare/circl v1.3.9 // indirect
+ 	github.com/database64128/netx-go v0.0.0-20240905055117-62795b8b054a // indirect
+ 	github.com/database64128/tfo-go/v2 v2.2.2 // indirect
+ 	github.com/davecgh/go-spew v1.1.1 // indirect
+ 	github.com/fsnotify/fsnotify v1.7.0 // indirect
+-	github.com/go-ole/go-ole v1.3.0 // indirect
+ 	github.com/go-task/slim-sprig v0.0.0-20230315185526-52ccab3ef572 // indirect
+ 	github.com/google/go-querystring v1.1.0 // indirect
+ 	github.com/google/pprof v0.0.0-20210407192527-94a9f03dee38 // indirect
+@@ -59,8 +55,6 @@ require (
+ 	github.com/pmezard/go-difflib v1.0.0 // indirect
+ 	github.com/quic-go/qpack v0.5.1 // indirect
+ 	github.com/refraction-networking/utls v1.6.6 // indirect
+-	github.com/sagernet/netlink v0.0.0-20220905062125-8043b4a9aa97 // indirect
+-	github.com/scjalliance/comshim v0.0.0-20230315213746-5e51f40bd3b9 // indirect
+ 	github.com/spf13/afero v1.9.3 // indirect
+ 	github.com/spf13/cast v1.5.0 // indirect
+ 	github.com/spf13/jwalterweatherman v1.1.0 // indirect
+@@ -68,12 +62,10 @@ require (
+ 	github.com/stretchr/objx v0.5.2 // indirect
+ 	github.com/subosito/gotenv v1.4.2 // indirect
+ 	github.com/txthinking/runnergroup v0.0.0-20210608031112-152c7c4432bf // indirect
+-	github.com/vishvananda/netns v0.0.0-20211101163701-50045581ed74 // indirect
+ 	github.com/vultr/govultr/v3 v3.6.4 // indirect
+ 	go.uber.org/atomic v1.11.0 // indirect
+ 	go.uber.org/mock v0.5.0 // indirect
+ 	go.uber.org/multierr v1.11.0 // indirect
+-	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
+ 	golang.org/x/crypto v0.26.0 // indirect
+ 	golang.org/x/mod v0.18.0 // indirect
+ 	golang.org/x/net v0.28.0 // indirect
+diff --git a/app/go.sum b/app/go.sum
+index 9bc7ae7..d1733a0 100644
+--- a/app/go.sum
++++ b/app/go.sum
+@@ -44,10 +44,6 @@ github.com/apernet/go-tproxy v0.0.0-20230809025308-8f4723fd742f h1:uVh0qpEslrWjg
+ github.com/apernet/go-tproxy v0.0.0-20230809025308-8f4723fd742f/go.mod h1:xkkq9D4ygcldQQhKS/w9CadiCKwCngU7K9E3DaKahpM=
+ github.com/apernet/quic-go v0.52.1-0.20250607183305-9320c9d14431 h1:9/jM7e+kVALd7Jfu1c27dcEpT/Fd/Gzq2OsQjKjakKI=
+ github.com/apernet/quic-go v0.52.1-0.20250607183305-9320c9d14431/go.mod h1:I/47OIGG5H/IfAm+nz2c6hm6b/NkEhpvptAoiPcY7jQ=
+-github.com/apernet/sing-tun v0.2.6-0.20240323130332-b9f6511036ad h1:QzQ2sKpc9o42HNRR8ukM5uMC/RzR2HgZd/Nvaqol2C0=
+-github.com/apernet/sing-tun v0.2.6-0.20240323130332-b9f6511036ad/go.mod h1:S5IydyLSN/QAfvY+r2GoomPJ6hidtXWm/Ad18sJVssk=
+-github.com/babolivier/go-doh-client v0.0.0-20201028162107-a76cff4cb8b6 h1:4NNbNM2Iq/k57qEu7WfL67UrbPq1uFWxW4qODCohi+0=
+-github.com/babolivier/go-doh-client v0.0.0-20201028162107-a76cff4cb8b6/go.mod h1:J29hk+f9lJrblVIfiJOtTFk+OblBawmib4uz/VdKzlg=
+ github.com/benbjohnson/clock v1.1.0 h1:Q92kusRqC1XV2MjkWETPvjJVqKetz1OzxZB7mHJLju8=
+ github.com/benbjohnson/clock v1.1.0/go.mod h1:J11/hYXuz8f4ySSvYwY0FKfm+ezbsZBKZxNJlLklBHA=
+ github.com/caddyserver/certmagic v0.17.2 h1:o30seC1T/dBqBCNNGNHWwj2i5/I/FMjBbTAhjADP3nE=
+@@ -87,8 +83,6 @@ github.com/go-gl/glfw/v3.3/glfw v0.0.0-20191125211704-12ad95a8df72/go.mod h1:tQ2
+ github.com/go-gl/glfw/v3.3/glfw v0.0.0-20200222043503-6f7a984d4dc4/go.mod h1:tQ2UAYgL5IevRw8kRxooKSPJfGvJ9fJQFa0TUsXzTg8=
+ github.com/go-logr/logr v1.2.4 h1:g01GSCwiDw2xSZfjJ2/T9M+S6pFdcNtFYsp+Y43HYDQ=
+ github.com/go-logr/logr v1.2.4/go.mod h1:jdQByPbusPIv2/zmleS9BjJVeZ6kBagPoEUsqbVz/1A=
+-github.com/go-ole/go-ole v1.3.0 h1:Dt6ye7+vXGIKZ7Xtk4s6/xVdGDQynvom7xCFEdWr6uE=
+-github.com/go-ole/go-ole v1.3.0/go.mod h1:5LS6F96DhAwUc7C+1HLexzMXY1xGRSryjyPPKW6zv78=
+ github.com/go-task/slim-sprig v0.0.0-20230315185526-52ccab3ef572 h1:tfuBGBXKqDEevZMzYi5KSi8KkcZtzBcTgAUUtapy0OI=
+ github.com/go-task/slim-sprig v0.0.0-20230315185526-52ccab3ef572/go.mod h1:9Pwr4B2jHnOSGXyyzV8ROjYa2ojvAY6HCGYYfMoC3Ls=
+ github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b/go.mod h1:SBH7ygxi8pfUlaOkMMuAQtPIUF8ecWP5IEl/CR7VP2Q=
+@@ -238,12 +232,6 @@ github.com/rogpeppe/go-internal v1.3.0/go.mod h1:M8bDsm7K2OlrFYOpmOWEs/qY81heoFR
+ github.com/rogpeppe/go-internal v1.12.0 h1:exVL4IDcn6na9z1rAb56Vxr+CgyK3nn3O+epU5NdKM8=
+ github.com/rogpeppe/go-internal v1.12.0/go.mod h1:E+RYuTGaKKdloAfM02xzb0FW3Paa99yedzYV+kq4uf4=
+ github.com/russross/blackfriday/v2 v2.1.0/go.mod h1:+Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
+-github.com/sagernet/netlink v0.0.0-20220905062125-8043b4a9aa97 h1:iL5gZI3uFp0X6EslacyapiRz7LLSJyr4RajF/BhMVyE=
+-github.com/sagernet/netlink v0.0.0-20220905062125-8043b4a9aa97/go.mod h1:xLnfdiJbSp8rNqYEdIW/6eDO4mVoogml14Bh2hSiFpM=
+-github.com/sagernet/sing v0.3.2 h1:CwWcxUBPkMvwgfe2/zUgY5oHG9qOL8Aob/evIFYK9jo=
+-github.com/sagernet/sing v0.3.2/go.mod h1:qHySJ7u8po9DABtMYEkNBcOumx7ZZJf/fbv2sfTkNHE=
+-github.com/scjalliance/comshim v0.0.0-20230315213746-5e51f40bd3b9 h1:rc/CcqLH3lh8n+csdOuDfP+NuykE0U6AeYSJJHKDgSg=
+-github.com/scjalliance/comshim v0.0.0-20230315213746-5e51f40bd3b9/go.mod h1:a/83NAfUXvEuLpmxDssAXxgUgrEy12MId3Wd7OTs76s=
+ github.com/spf13/afero v1.9.3 h1:41FoI0fD7OR7mGcKE/aOiLkGreyf8ifIOQmJANWogMk=
+ github.com/spf13/afero v1.9.3/go.mod h1:iUV7ddyEEZPO5gA3zD4fJt6iStLlL+Lg4m2cihcDf8Y=
+ github.com/spf13/cast v1.5.0 h1:rj3WzYc11XZaIZMPKmwP96zkFEnnAmV8s6XbB2aY32w=
+@@ -278,8 +266,6 @@ github.com/txthinking/runnergroup v0.0.0-20210608031112-152c7c4432bf h1:7PflaKRt
+ github.com/txthinking/runnergroup v0.0.0-20210608031112-152c7c4432bf/go.mod h1:CLUSJbazqETbaR+i0YAhXBICV9TrKH93pziccMhmhpM=
+ github.com/txthinking/socks5 v0.0.0-20230325130024-4230056ae301 h1:d/Wr/Vl/wiJHc3AHYbYs5I3PucJvRuw3SvbmlIRf+oM=
+ github.com/txthinking/socks5 v0.0.0-20230325130024-4230056ae301/go.mod h1:ntmMHL/xPq1WLeKiw8p/eRATaae6PiVRNipHFJxI8PM=
+-github.com/vishvananda/netns v0.0.0-20211101163701-50045581ed74 h1:gga7acRE695APm9hlsSMoOoE65U4/TcqNj90mc69Rlg=
+-github.com/vishvananda/netns v0.0.0-20211101163701-50045581ed74/go.mod h1:DD4vA1DwXk04H54A1oHXtwZmA0grkVMdPxx/VGLCah0=
+ github.com/vultr/govultr/v3 v3.6.4 h1:unvY9eXlBw667ECQZDbBDOIaWB8wkk6Bx+yB0IMKXJ4=
+ github.com/vultr/govultr/v3 v3.6.4/go.mod h1:rt9v2x114jZmmLAE/h5N5jnxTmsK9ewwS2oQZ0UBQzM=
+ github.com/yuin/goldmark v1.1.25/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
+@@ -308,8 +294,6 @@ go.uber.org/multierr v1.11.0/go.mod h1:20+QtiLqy0Nd6FdQB9TLXag12DsQkrbs3htMFfDN8
+ go.uber.org/zap v1.21.0/go.mod h1:wjWOCqI0f2ZZrJF/UufIOkiC8ii6tm1iqIsLo76RfJw=
+ go.uber.org/zap v1.24.0 h1:FiJd5l1UOLj0wCgbSE0rwwXHzEdAZS6hiiSnxJN/D60=
+ go.uber.org/zap v1.24.0/go.mod h1:2kMP+WWQ8aoFoedH3T2sq6iJ2yDWpHbP0f6MQbS9Gkg=
+-go4.org/netipx v0.0.0-20231129151722-fdeea329fbba h1:0b9z3AuHCjxk0x/opv64kcgZLBseWJUpBw5I82+2U4M=
+-go4.org/netipx v0.0.0-20231129151722-fdeea329fbba/go.mod h1:PLyyIXexvUFg3Owu6p/WfdlivPbZJsZdgWZlrGope/Y=
+ golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACkg1iLfiJU5Ep61QUkGW8qpdssI0+w=
+ golang.org/x/crypto v0.0.0-20190510104115-cbcb75029529/go.mod h1:yigFU9vqHzYiE8UmvKecakEJjdnWj3jj499lnFckfCI=
+ golang.org/x/crypto v0.0.0-20190605123033-f99c8df09eb5/go.mod h1:yigFU9vqHzYiE8UmvKecakEJjdnWj3jj499lnFckfCI=
+@@ -441,7 +425,6 @@ golang.org/x/sys v0.0.0-20200113162924-86b910548bc1/go.mod h1:h1NjWce9XRLGQEsW7w
+ golang.org/x/sys v0.0.0-20200122134326-e047566fdf82/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20200202164722-d101bd2416d5/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20200212091648-12a6c2dcc1e4/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+-golang.org/x/sys v0.0.0-20200217220822-9197077df867/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20200223170610-d5e6a3e2c0ae/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20200302150141-5c8b2ff67527/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20200323222414-85ca7c5b95cd/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+@@ -465,7 +448,6 @@ golang.org/x/sys v0.0.0-20210615035016-665e8c7367d1/go.mod h1:oPkhp1MJrh7nUepCBc
+ golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20220704084225-05e143d24a9e/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20220722155257-8c9f86f7a55f/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+-golang.org/x/sys v0.1.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.2.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.25.0 h1:r+8e+loiHxRqhXVl6ML1nO3l1+oFoWbnlu2Ehimmi34=
+ golang.org/x/sys v0.25.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
+diff --git a/app/internal/tun/check_ipv6_others.go b/app/internal/tun/check_ipv6_others.go
+deleted file mode 100644
+index 7cfd9ab..0000000
+--- a/app/internal/tun/check_ipv6_others.go
++++ /dev/null
+@@ -1,14 +0,0 @@
+-//go:build !unix && !windows
+-
+-package tun
+-
+-import "net"
+-
+-func isIPv6Supported() bool {
+-	lis, err := net.ListenPacket("udp6", "[::1]:0")
+-	if err != nil {
+-		return false
+-	}
+-	_ = lis.Close()
+-	return true
+-}
+diff --git a/app/internal/tun/check_ipv6_unix.go b/app/internal/tun/check_ipv6_unix.go
+deleted file mode 100644
+index 8fdffaf..0000000
+--- a/app/internal/tun/check_ipv6_unix.go
++++ /dev/null
+@@ -1,16 +0,0 @@
+-//go:build unix
+-
+-package tun
+-
+-import (
+-	"golang.org/x/sys/unix"
+-)
+-
+-func isIPv6Supported() bool {
+-	sock, err := unix.Socket(unix.AF_INET6, unix.SOCK_DGRAM, unix.IPPROTO_UDP)
+-	if err != nil {
+-		return false
+-	}
+-	_ = unix.Close(sock)
+-	return true
+-}
+diff --git a/app/internal/tun/check_ipv6_windows.go b/app/internal/tun/check_ipv6_windows.go
+deleted file mode 100644
+index d488d7e..0000000
+--- a/app/internal/tun/check_ipv6_windows.go
++++ /dev/null
+@@ -1,24 +0,0 @@
+-//go:build windows
+-
+-package tun
+-
+-import (
+-	"golang.org/x/sys/windows"
+-)
+-
+-func isIPv6Supported() bool {
+-	var wsaData windows.WSAData
+-	err := windows.WSAStartup(uint32(0x202), &wsaData)
+-	if err != nil {
+-		// Failing silently: it is not our duty to report such errors
+-		return true
+-	}
+-	defer windows.WSACleanup()
+-
+-	sock, err := windows.Socket(windows.AF_INET6, windows.SOCK_DGRAM, windows.IPPROTO_UDP)
+-	if err != nil {
+-		return false
+-	}
+-	_ = windows.Closesocket(sock)
+-	return true
+-}
+diff --git a/app/internal/tun/log.go b/app/internal/tun/log.go
+deleted file mode 100644
+index b30309d..0000000
+--- a/app/internal/tun/log.go
++++ /dev/null
+@@ -1,77 +0,0 @@
+-package tun
+-
+-import (
+-	"github.com/sagernet/sing/common/logger"
+-	"go.uber.org/zap"
+-)
+-
+-var _ logger.Logger = (*singLogger)(nil)
+-
+-type singLogger struct {
+-	tag       string
+-	zapLogger *zap.Logger
+-}
+-
+-func extractSingExceptions(args []any) {
+-	for i, arg := range args {
+-		if err, ok := arg.(error); ok {
+-			args[i] = err.Error()
+-		}
+-	}
+-}
+-
+-func (l *singLogger) Trace(args ...any) {
+-	if l.zapLogger == nil {
+-		return
+-	}
+-	extractSingExceptions(args)
+-	l.zapLogger.Debug(l.tag, zap.Any("args", args))
+-}
+-
+-func (l *singLogger) Debug(args ...any) {
+-	if l.zapLogger == nil {
+-		return
+-	}
+-	extractSingExceptions(args)
+-	l.zapLogger.Debug(l.tag, zap.Any("args", args))
+-}
+-
+-func (l *singLogger) Info(args ...any) {
+-	if l.zapLogger == nil {
+-		return
+-	}
+-	extractSingExceptions(args)
+-	l.zapLogger.Info(l.tag, zap.Any("args", args))
+-}
+-
+-func (l *singLogger) Warn(args ...any) {
+-	if l.zapLogger == nil {
+-		return
+-	}
+-	extractSingExceptions(args)
+-	l.zapLogger.Warn(l.tag, zap.Any("args", args))
+-}
+-
+-func (l *singLogger) Error(args ...any) {
+-	if l.zapLogger == nil {
+-		return
+-	}
+-	extractSingExceptions(args)
+-	l.zapLogger.Error(l.tag, zap.Any("args", args))
+-}
+-
+-func (l *singLogger) Fatal(args ...any) {
+-	if l.zapLogger == nil {
+-		return
+-	}
+-	extractSingExceptions(args)
+-	l.zapLogger.Fatal(l.tag, zap.Any("args", args))
+-}
+-
+-func (l *singLogger) Panic(args ...any) {
+-	if l.zapLogger == nil {
+-		return
+-	}
+-	extractSingExceptions(args)
+-	l.zapLogger.Panic(l.tag, zap.Any("args", args))
+-}
+diff --git a/app/internal/tun/server.go b/app/internal/tun/server.go
+deleted file mode 100644
+index a999051..0000000
+--- a/app/internal/tun/server.go
++++ /dev/null
+@@ -1,234 +0,0 @@
+-package tun
+-
+-import (
+-	"context"
+-	"fmt"
+-	"io"
+-	"net"
+-	"net/netip"
+-
+-	tun "github.com/apernet/sing-tun"
+-	"github.com/sagernet/sing/common/buf"
+-	"github.com/sagernet/sing/common/control"
+-	"github.com/sagernet/sing/common/metadata"
+-	"github.com/sagernet/sing/common/network"
+-	"go.uber.org/zap"
+-
+-	"github.com/apernet/hysteria/core/v2/client"
+-)
+-
+-type Server struct {
+-	HyClient    client.Client
+-	EventLogger EventLogger
+-
+-	// for debugging
+-	Logger *zap.Logger
+-
+-	IfName  string
+-	MTU     uint32
+-	Timeout int64 // in seconds, also applied to TCP in system stack
+-
+-	// required by system stack
+-	Inet4Address []netip.Prefix
+-	Inet6Address []netip.Prefix
+-
+-	// auto route
+-	AutoRoute                bool
+-	StructRoute              bool
+-	Inet4RouteAddress        []netip.Prefix
+-	Inet6RouteAddress        []netip.Prefix
+-	Inet4RouteExcludeAddress []netip.Prefix
+-	Inet6RouteExcludeAddress []netip.Prefix
+-}
+-
+-type EventLogger interface {
+-	TCPRequest(addr, reqAddr string)
+-	TCPError(addr, reqAddr string, err error)
+-	UDPRequest(addr string)
+-	UDPError(addr string, err error)
+-}
+-
+-func (s *Server) Serve() error {
+-	if !isIPv6Supported() {
+-		s.Logger.Warn("tun-pre-check", zap.String("msg", "IPv6 is not supported or enabled on this system, TUN device is created without IPv6 support."))
+-		s.Inet6Address = nil
+-	}
+-	tunOpts := tun.Options{
+-		Name:                     s.IfName,
+-		Inet4Address:             s.Inet4Address,
+-		Inet6Address:             s.Inet6Address,
+-		MTU:                      s.MTU,
+-		GSO:                      true,
+-		AutoRoute:                s.AutoRoute,
+-		StrictRoute:              s.StructRoute,
+-		Inet4RouteAddress:        s.Inet4RouteAddress,
+-		Inet6RouteAddress:        s.Inet6RouteAddress,
+-		Inet4RouteExcludeAddress: s.Inet4RouteExcludeAddress,
+-		Inet6RouteExcludeAddress: s.Inet6RouteExcludeAddress,
+-		Logger: &singLogger{
+-			tag:       "tun",
+-			zapLogger: s.Logger,
+-		},
+-	}
+-	tunIf, err := tun.New(tunOpts)
+-	if err != nil {
+-		return fmt.Errorf("failed to create tun interface: %w", err)
+-	}
+-	defer tunIf.Close()
+-
+-	tunStack, err := tun.NewSystem(tun.StackOptions{
+-		Context:    context.Background(),
+-		Tun:        tunIf,
+-		TunOptions: tunOpts,
+-		UDPTimeout: s.Timeout,
+-		Handler:    &tunHandler{s},
+-		Logger: &singLogger{
+-			tag:       "tun-stack",
+-			zapLogger: s.Logger,
+-		},
+-		ForwarderBindInterface: true,
+-		InterfaceFinder:        &interfaceFinder{},
+-	})
+-	if err != nil {
+-		return fmt.Errorf("failed to create tun stack: %w", err)
+-	}
+-	defer tunStack.Close()
+-	return tunStack.(tun.StackRunner).Run()
+-}
+-
+-type tunHandler struct {
+-	*Server
+-}
+-
+-var _ tun.Handler = (*tunHandler)(nil)
+-
+-func (t *tunHandler) NewConnection(ctx context.Context, conn net.Conn, m metadata.Metadata) error {
+-	addr := m.Source.String()
+-	reqAddr := m.Destination.String()
+-	if t.EventLogger != nil {
+-		t.EventLogger.TCPRequest(addr, reqAddr)
+-	}
+-	var closeErr error
+-	defer func() {
+-		if t.EventLogger != nil {
+-			t.EventLogger.TCPError(addr, reqAddr, closeErr)
+-		}
+-	}()
+-	rc, err := t.HyClient.TCP(reqAddr)
+-	if err != nil {
+-		closeErr = err
+-		// the returned err is ignored by caller
+-		return nil
+-	}
+-	defer rc.Close()
+-
+-	// start forwarding
+-	copyErrChan := make(chan error, 3)
+-	go func() {
+-		<-ctx.Done()
+-		copyErrChan <- ctx.Err()
+-	}()
+-	go func() {
+-		_, copyErr := io.Copy(rc, conn)
+-		copyErrChan <- copyErr
+-	}()
+-	go func() {
+-		_, copyErr := io.Copy(conn, rc)
+-		copyErrChan <- copyErr
+-	}()
+-	closeErr = <-copyErrChan
+-	return nil
+-}
+-
+-func (t *tunHandler) NewPacketConnection(ctx context.Context, conn network.PacketConn, m metadata.Metadata) error {
+-	addr := m.Source.String()
+-	if t.EventLogger != nil {
+-		t.EventLogger.UDPRequest(addr)
+-	}
+-	var closeErr error
+-	defer func() {
+-		if t.EventLogger != nil {
+-			t.EventLogger.UDPError(addr, closeErr)
+-		}
+-	}()
+-	rc, err := t.HyClient.UDP()
+-	if err != nil {
+-		closeErr = err
+-		// the returned err is simply called into NewError again
+-		return nil
+-	}
+-	defer rc.Close()
+-
+-	// start forwarding
+-	copyErrChan := make(chan error, 3)
+-	go func() {
+-		<-ctx.Done()
+-		copyErrChan <- ctx.Err()
+-	}()
+-	// local <- remote
+-	go func() {
+-		for {
+-			bs, from, err := rc.Receive()
+-			if err != nil {
+-				copyErrChan <- err
+-				return
+-			}
+-			var fromAddr metadata.Socksaddr
+-			if ap, perr := netip.ParseAddrPort(from); perr == nil {
+-				fromAddr = metadata.SocksaddrFromNetIP(ap)
+-			} else {
+-				fromAddr.Fqdn = from
+-			}
+-			err = conn.WritePacket(buf.As(bs), fromAddr)
+-			if err != nil {
+-				copyErrChan <- err
+-				return
+-			}
+-		}
+-	}()
+-	// local -> remote
+-	go func() {
+-		buffer := buf.NewPacket()
+-		defer buffer.Release()
+-
+-		for {
+-			buffer.Reset()
+-			addr, err := conn.ReadPacket(buffer)
+-			if err != nil {
+-				copyErrChan <- err
+-				return
+-			}
+-			err = rc.Send(buffer.Bytes(), addr.String())
+-			if err != nil {
+-				copyErrChan <- err
+-				return
+-			}
+-		}
+-	}()
+-	closeErr = <-copyErrChan
+-	return nil
+-}
+-
+-func (t *tunHandler) NewError(ctx context.Context, err error) {
+-	// unused
+-}
+-
+-type interfaceFinder struct{}
+-
+-var _ control.InterfaceFinder = (*interfaceFinder)(nil)
+-
+-func (f *interfaceFinder) InterfaceIndexByName(name string) (int, error) {
+-	ifce, err := net.InterfaceByName(name)
+-	if err != nil {
+-		return -1, err
+-	}
+-	return ifce.Index, nil
+-}
+-
+-func (f *interfaceFinder) InterfaceNameByIndex(index int) (string, error) {
+-	ifce, err := net.InterfaceByIndex(index)
+-	if err != nil {
+-		return "", err
+-	}
+-	return ifce.Name, nil
+-}
+diff --git a/extras/go.mod b/extras/go.mod
+index 23b060a..d33bd59 100644
+--- a/extras/go.mod
++++ b/extras/go.mod
+@@ -7,7 +7,6 @@ toolchain go1.24.2
+ require (
+ 	github.com/apernet/hysteria/core/v2 v2.0.0-00010101000000-000000000000
+ 	github.com/apernet/quic-go v0.52.1-0.20250607183305-9320c9d14431
+-	github.com/babolivier/go-doh-client v0.0.0-20201028162107-a76cff4cb8b6
+ 	github.com/database64128/tfo-go/v2 v2.2.2
+ 	github.com/hashicorp/golang-lru/v2 v2.0.5
+ 	github.com/miekg/dns v1.1.59
+diff --git a/extras/go.sum b/extras/go.sum
+index ac6d04a..3daca00 100644
+--- a/extras/go.sum
++++ b/extras/go.sum
+@@ -2,8 +2,6 @@ github.com/andybalholm/brotli v1.1.0 h1:eLKJA0d02Lf0mVpIDgYnqXcUn0GqVmEFny3VuID1
+ github.com/andybalholm/brotli v1.1.0/go.mod h1:sms7XGricyQI9K10gOSf56VKKWS4oLer58Q+mhRPtnY=
+ github.com/apernet/quic-go v0.52.1-0.20250607183305-9320c9d14431 h1:9/jM7e+kVALd7Jfu1c27dcEpT/Fd/Gzq2OsQjKjakKI=
+ github.com/apernet/quic-go v0.52.1-0.20250607183305-9320c9d14431/go.mod h1:I/47OIGG5H/IfAm+nz2c6hm6b/NkEhpvptAoiPcY7jQ=
+-github.com/babolivier/go-doh-client v0.0.0-20201028162107-a76cff4cb8b6 h1:4NNbNM2Iq/k57qEu7WfL67UrbPq1uFWxW4qODCohi+0=
+-github.com/babolivier/go-doh-client v0.0.0-20201028162107-a76cff4cb8b6/go.mod h1:J29hk+f9lJrblVIfiJOtTFk+OblBawmib4uz/VdKzlg=
+ github.com/chzyer/logex v1.1.10/go.mod h1:+Ywpsq7O8HXn0nuIou7OrIPyXbp3wmkHB+jjWRnGsAI=
+ github.com/chzyer/readline v0.0.0-20180603132655-2972be24d48e/go.mod h1:nSuG5e5PlCu98SY8svDHJxuZscDgtXS6KTTbou5AhLI=
+ github.com/chzyer/test v0.0.0-20180213035817-a1ea475d72b1/go.mod h1:Q3SI9o4m/ZMnBNeIyt5eFwwo7qiLfzFZmjNmxjkiQlU=
+diff --git a/extras/outbounds/dns_https.go b/extras/outbounds/dns_https.go
+deleted file mode 100644
+index daf0dfe..0000000
+--- a/extras/outbounds/dns_https.go
++++ /dev/null
+@@ -1,84 +0,0 @@
+-package outbounds
+-
+-import (
+-	"crypto/tls"
+-	"net"
+-	"net/http"
+-	"time"
+-
+-	"github.com/babolivier/go-doh-client"
+-)
+-
+-// dohResolver is a PluggableOutbound DNS resolver that resolves hostnames
+-// using the user-provided DNS-over-HTTPS server.
+-type dohResolver struct {
+-	Resolver *doh.Resolver
+-	Next     PluggableOutbound
+-}
+-
+-func NewDoHResolver(host string, timeout time.Duration, sni string, insecure bool, next PluggableOutbound) PluggableOutbound {
+-	tr := http.DefaultTransport.(*http.Transport).Clone()
+-	tr.TLSClientConfig = &tls.Config{
+-		ServerName:         sni,
+-		InsecureSkipVerify: insecure,
+-	}
+-	return &dohResolver{
+-		Resolver: &doh.Resolver{
+-			Host:  host,
+-			Class: doh.IN,
+-			HTTPClient: &http.Client{
+-				Transport: tr,
+-				Timeout:   timeoutOrDefault(timeout),
+-			},
+-		},
+-		Next: next,
+-	}
+-}
+-
+-func (r *dohResolver) resolve(reqAddr *AddrEx) {
+-	if tryParseIP(reqAddr) {
+-		// The host is already an IP address, we don't need to resolve it.
+-		return
+-	}
+-	type lookupResult struct {
+-		ip  net.IP
+-		err error
+-	}
+-	ch4, ch6 := make(chan lookupResult, 1), make(chan lookupResult, 1)
+-	go func() {
+-		recs, _, err := r.Resolver.LookupA(reqAddr.Host)
+-		var ip net.IP
+-		if err == nil && len(recs) > 0 {
+-			ip = net.ParseIP(recs[0].IP4).To4()
+-		}
+-		ch4 <- lookupResult{ip, err}
+-	}()
+-	go func() {
+-		recs, _, err := r.Resolver.LookupAAAA(reqAddr.Host)
+-		var ip net.IP
+-		if err == nil && len(recs) > 0 {
+-			ip = net.ParseIP(recs[0].IP6).To16()
+-		}
+-		ch6 <- lookupResult{ip, err}
+-	}()
+-	result4, result6 := <-ch4, <-ch6
+-	reqAddr.ResolveInfo = &ResolveInfo{
+-		IPv4: result4.ip,
+-		IPv6: result6.ip,
+-	}
+-	if result4.err != nil {
+-		reqAddr.ResolveInfo.Err = result4.err
+-	} else if result6.err != nil {
+-		reqAddr.ResolveInfo.Err = result6.err
+-	}
+-}
+-
+-func (r *dohResolver) TCP(reqAddr *AddrEx) (net.Conn, error) {
+-	r.resolve(reqAddr)
+-	return r.Next.TCP(reqAddr)
+-}
+-
+-func (r *dohResolver) UDP(reqAddr *AddrEx) (UDPConn, error) {
+-	r.resolve(reqAddr)
+-	return r.Next.UDP(reqAddr)
+-}
